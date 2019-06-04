@@ -7,14 +7,15 @@ import sys
 import glob
 import argparse
 
-partitioning_strategies = ['exclude_one', 'test2', 'test3']
+partitioning_strategies = ['windows', 'undefine1', 'undefined2']         # to be completed ?????????????
 
 def parse_arguments():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description='feature-set partioning'
+    )
 
     parser.add_argument('--in_dir',
                         type=str,
-                        default='inputs',
                         help='Directory containing feature-set list files')
 
     parser.add_argument('--out_dir',
@@ -22,13 +23,15 @@ def parse_arguments():
                         type=str,
                         help='Directory to contain generated plan files')
 
+    parser.add_argument('--json',
+                        action='store_true',
+                        help='Generate plan in JSON format')
+
     parser.add_argument('--overwrite',
-                        default=False,
                         action='store_true',
                         help='Accept non-empty out_dir, contents overwritten')
 
     parser.add_argument('--verbose',
-                        default=False,
                         action='store_true',
                         help='Trace execution')
 
@@ -46,15 +49,15 @@ def parse_arguments():
                         nargs='+',
                         help='Specify a list of (arbitrary) feature-set names')
 
-    parser.add_argument('--fs_parts',
+    parser.add_argument('--fs_paths',
                         required=True,
                         type=str,
                         nargs='+',
-                        help='Specify a list of partition counts')
+                        help='Specify a list of feature-set file paths')
 
-    parser.add_argument('--fs_files',
+    parser.add_argument('--fs_parts',
                         required=True,
-                        type=str,
+                        type=int,
                         nargs='+',
                         help='Specify a list of partition counts')
 

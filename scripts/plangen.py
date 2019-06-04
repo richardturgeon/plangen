@@ -1,23 +1,140 @@
 
-import os
-import sys
+import glob
+import itertools  as it
 import json
 import numpy as np
-import itertools  as it
+import os
 import planargs
+import sys
 
 from abc import ABC, abstractmethod     # abstract class support
 from scipy.special import comb
 from pprint import pprint as pp
 
 
+def isempty(path):
+    """Determine whether the given directory is empty."""
+    flist = glob.glob(os.path.join(path,'*'))
+    return flist == []
+
+def validate_args(args):
+    """Validate the execution arguments as defined in planargs.py.
+
+    This function validates input arguments defined in the 'args' namespace.
+    The inputs are lists series of feature-set names (fs_names), files
+    (fs_paths) and partitioning attributes (fs_parts). fs_names and fs_files
+    must designate the same number of parameters. For example:
+
+        --fs_names CELL DRUG --fs_paths cells.txt drugs.txt
+
+    The CELL name is paired with the cells.txt file, DRUG with drugs.txt, etc.
+    Currently, this one for one correspondence also applies to the fs_part arg,
+    which specifies the number of partitions the feature-set list is broken
+    into at every level of the plan generation recursion. A complete example
+    might look like this:
+
+        --fsnames CELL DRUG --fs_paths cells.txt drugs.txt --fs_parts 2 2
+
+    An output directory for the plan in any of its formats is given by out_dir.
+    An input directory may be specified via in_dir to simplify the coding of
+    fs_paths. Otherwise, feature-set files must be fully specified. Each of the
+    files is read and returned.
+
+    DOCUMENT ALL ARGS ??????????????????????
+
+    Returns:
+        Upon success, a list of feature-set entry lists is returned. All entries
+        are stripped of white-space, all white-space lines have been removed.
+        For example:
+
+            [[CELL1 ... CELLn] [DRUG1 ... DRUGn]]
+
+        Additionally, args.generator is instantiated with a class defining the selected partition()
+        function (future).
+    """
+    params = {}
+    verbose = args.verbose
+
+    fs_names_len = len(args.fs_names)
+    fs_paths_len = len(args.fs_paths)
+    fs_parts_len = len(args.fs_parts)
+
+    nbr_feature_sets = fs_names_len
+    test_lengths = [fs_names_len, fs_paths_len, fs_parts_len]
+    reqd_lengths = [nbr_feature_sets] * 3
+
+    if test_lengths != reqd_lengths:
+        sys.exit("Error: The lengths of all feature set definition args (fs_<>) must be identical")
+
+    if nbr_feature_sets <= 1:
+        sys.exit("Error: Partitioning requires multiple feature sets")
+
+    for nparts in args.fs_parts:
+        if nparts <= 1 or nparts >= 8:
+            sys.exit("Error: Invalid partitioning value %d" % nparts)
+
+    # validate input and output directories
+    if args.in_dir and not os.path.isdir(args.in_dir):
+        sys.exit("Error: --in_dir must designate a directory, '%s' is not valid" % args.in_dir)
+
+    if not os.path.isdir(args.out_dir):
+        sys.exit("Error: --out_dir must designate a directory, '%s' is not valid" % args.out_dir)
+
+    if not args.overwrite and not isempty(args.out_dir):
+        sys.exit("Error: --out_dir '%s' is not empty, --overwrite not specified" % args.out_dir)
+
+    if verbose:
+        print("Writing plan information to %s" % os.path.abspath(args.out_dir))
+
+    # expand, validate and load input feature-set content lists 
+    feature_set_content = []
+    file_error = False
+    if args.in_dir == None:
+        args.in_dir = ''    # prepare for use in os.path.join()
+
+    for i, path in enumerate(args.fs_paths):
+        fullpath = os.path.join(args.in_dir, path)
+        if not os.path.exists(fullpath):
+            file_error = True
+            print("Error: %s file not found" % fullpath)
+        else:
+            with open(fullpath, 'r') as f:          # read text and sanitize
+                raw_lines = f.readlines()
+
+            lines = [line.strip() for line in raw_lines]
+            lines = [l for l in lines if l != '']
+            feature_set_content.append(lines)
+
+            if verbose:
+                print("Loading '%s' feature set definition from %s - %d lines"
+                    % (args.fs_names[i], fullpath, len(lines)))
+
+    if file_error:
+        sys.exit("Terminating due to error")
+
+    # construct a partitioning object exporting a partion() function
+
+    if args.partition_strategy == 'windows':
+        args.generator = WindowsSubsetGenerator()
+
+    # return feature-set contents lists
+    return feature_set_content
+
 
 class SubsetGenerator(ABC):
-    """ """
- 
-    def __init__(self, working_dir, name=''):
+    """Abstract class implementing a data partitioning method.
+
+    The SubsetGenerator class provides a template for subclasses that implement
+    mechanisms for dividing sets of lists into sublists for the purpose of 
+    defining unique ML training and validation sets.
+
+    Subclasses must implement those methods defined as @abstractmethod.
+    The validate() function provided here does a sanity test for all anticipated
+    partitioning schemes. Subclasses should implement their specializations.
+    """
+
+    def __init__(self, name=''):
         self.name = name
-        self.working_dir = working_dir
         self.term_msg = "Terminating due to error"
 
     @abstractmethod
@@ -28,21 +145,26 @@ class SubsetGenerator(ABC):
         count=None,
         name='-unspecified-'
     ):
+        """Partion a feature-set array.
+
+        Partition the 'base', a list of elements, using the abstract arguments
+        'size' and 'count' to tailor the implementation's algorithm. 'name' is
+        used in error reporting and is optional.
+        """
         validate(self, base, size, count, name)
-        return 0
+        return []
 
 
     def _validation_error(self, base_len, size, count, name='-unspecified-'):
-        """ """
+        """Provide a common error reporting function. """
         print("Base list length: %d requested %d sublists of length %d" %
             (base_len, count, size))
 
 
     def validate(self, base, size=None, count=None, name='-unspecified-'):
-        """ basic request validation, specific generators may impose
+        """Provide basic request validation, specific generators may impose
         additional requirements.
         """
-
         berror = False
         base_len = len(base)
 
@@ -57,11 +179,14 @@ class SubsetGenerator(ABC):
 
         return not berror
 
-class IterativeSubsetGenerator(SubsetGenerator):
-    """ subset generation via iteration over base """
+#
+# UNDER EVALUATION ?????????????????????????????????????????????????????
+#
 
-    def __init__(self, working_dir):
-        SubsetGenerator.__init__(self, working_dir, 'IterativeSubsetGenerator')
+class IterativeSubsetGenerator(SubsetGenerator):
+    """ Tom Brettin method... subset generation via iteration over base"""
+    def __init__(self):
+        SubsetGenerator.__init__(self, 'IterativeSubsetGenerator')
 
     def partition(self, base, size=None, count=0, name=None):
         """ """
@@ -108,13 +233,21 @@ class IterativeSubsetGenerator(SubsetGenerator):
 
         return selected_sublists
 
-class QuadrantSubsetGenerator(SubsetGenerator):
-    """ not-necessarily-square partitioning approach """
+#
+# RICK STEVEN'S PARTITIONING APPROACH 
+#
 
-    def __init__(self, working_dir):
-        SubsetGenerator.__init__(self, working_dir, 'QuadrantSubsetGenerator')
+class WindowsSubsetGenerator(SubsetGenerator):
+    """Not-necessarily-square partitioning approach.
+
+    DOCUMENTATION REQUIRED ?????????????
+    """
+
+    def __init__(self):
+        SubsetGenerator.__init__(self, 'WindowsSubsetGenerator')
 
     def partition(self, base, size='n/a', count=1, name=None):
+        """ partition list return sublists"""
         base_len = len(base)
         if base_len < count:
             return []
@@ -130,76 +263,6 @@ class QuadrantSubsetGenerator(SubsetGenerator):
 
         return sublists
 
-class RandomSubsetGenerator(SubsetGenerator):
-    """ subset generation via random selection from base """
-    pass
-
-
-#
-#
-#
-
-def get_feature_set_info(working_dir):
-    """ """
-    print("intro ... ")
-
-    feature_set_names = []
-    feature_set_paths = []
-
-    while True:
-        print("How many feature sets?")
-        response = sys.stdin.readline()
-        response = response.strip()
-        if response == '' or response == '0':
-            nbr_feature_sets = 0
-            break
-        try:
-            nbr_feature_sets = int(response)
-        except ValueError:
-            continue
-        break
-
-    for i in range(1, nbr_feature_sets + 1):
-        while True:
-            print("Enter the feature set %d name and its file path" % i)
-            response = sys.stdin.readline()
-            tokens = response.split()
-            if len(tokens) != 2:
-                continue
-
-            name = tokens[0].upper()
-            path = tokens[1]
-
-            if not os.path.isabs(path):
-                path = os.path.join(working_dir, path)
-            if not os.path.isfile(path):
-                print("File not found")
-                continue
-            if name in feature_set_names:
-                print("The %s feature set has already been defined")
-                continue
-
-            feature_set_names.append(name)
-            feature_set_paths.append(path)
-            break
-
-    return nbr_feature_sets, feature_set_names, feature_set_paths
-
-
-def get_working_dir():
-    while True:
-        print("Specify the working directory or <enter> for the current directory")
-        response = sys.stdin.readline()
-        response = response.strip()
-        if response == '':
-            response = './'
-            break
-
-        if not os.path.isdir(response):
-            print("%s is not a directory" % respose)
-            continue
-
-    return response
 
 def breakout(seq_list, names):
     dict = {}
@@ -208,53 +271,61 @@ def breakout(seq_list, names):
     return dict
 
 
-def build_tree(generator, params, feature_set_content, plan_dict, plan_key=None, depth=0, data_pfx='', plan_pfx=''):
-    this_depth = depth + 1
-    partition_spec = params['partition_spec']
-    feature_set_names = params['feature_set_names']
-    verbose = params['verbose']
-
+def build_plan_tree(args, feature_set_content, subplan_id=None, depth=0, data_pfx='', plan_pfx=''):
+    """ """
+    curr_depth = depth + 1
     flat_partitions = []
+    all_parts = []
     files = []
     sequence = 0
 
-    all_parts = []
-    for i in range(len(feature_set_content)):
+    for i in range(len(args.fs_names)):
         group = feature_set_content[i]
-        count = partition_spec[i]
-        feature_set_name = feature_set_names[i]
-        partitions = generator.partition(feature_set_content[i], count=count)   # name= ??????????????
+        count = args.fs_parts[i]
+        feature_set_name = args.fs_names[i]
+        partitions = args.generator.partition(feature_set_content[i], count=count)   # name= ??????????????
 #       print(partitions)
 
         if len(partitions) == 0:
-            return # ??????????????????????????????????????? fix this per M 
+            return 0 # ??????????????????????????????????????? fix this per M 
 
         all_parts.append(partitions)
 
     parts_xprod = np.array(list(it.product(*all_parts)))
-    local_steps = len(parts_xprod)
-    params['total_steps'] += local_steps
+    steps = len(parts_xprod)
+    substeps = 0
 
-    for plan_id in range(local_steps):
+    for plan_id in range(steps):
         train = []
+
+        # split into validation and training components
         for i, plan in enumerate(parts_xprod):
-
-            # define validations 
-
+            section = breakout(plan, args.fs_names)
             if i == plan_id:
-                val = [breakout(plan, feature_set_names)]
+                val = section
             else:
-                train.append(breakout(plan, feature_set_names))
+                train.append(section)
 
-        new_plan_key = '{}.{}'.format(plan_key, plan_id + 1)
-        plan_dict[new_plan_key] = {'val': val, 'train': train}
-
+        # generate next depth/level (successor) plans 
+        new_subplan_id = '{}.{}'.format(subplan_id, plan_id + 1)
+        args.plan_dict[new_subplan_id] = {'val': val, 'train': train}
         data_name = '{}.{}'.format(data_pfx, plan_id + 1)
         plan_name = '{}.{}'.format(plan_pfx, plan_id + 1)
-        build_tree(generator, params, parts_xprod[plan_id], plan_dict, plan_key=new_plan_key, depth=this_depth, data_pfx=data_name, plan_pfx=plan_name)
 
+        substeps += build_plan_tree(
+            args,
+            parts_xprod[plan_id],
+            subplan_id=new_subplan_id,
+            depth=curr_depth,
+            data_pfx=data_name,
+            plan_pfx=plan_name
+        )
 
-        """
+    steps += substeps
+    return steps
+
+    """
+    # THIS IS A WORK-IN-PROGRESS ... GENERATING FILES FOR DATA AND PLAN
         files.append([])
         files_ndx = len(files) - 1
 
@@ -270,7 +341,7 @@ def build_tree(generator, params, feature_set_content, plan_dict, plan_key=None,
             #write_file(file_name, part)
             pair = (feature_set_name, file_name)
             files[files_ndx].append(pair)
-        """
+    """
     """
     file_xprod = np.array(list(it.product(*files)))
     nbr_plans = len(file_xprod)
@@ -304,9 +375,17 @@ def build_tree(generator, params, feature_set_content, plan_dict, plan_key=None,
 
         data_name = '{}.{}'.format(data_pfx, seq + 1)
         plan_name = '{}.{}'.format(plan_pfx, seq + 1)
-        build_tree(generator, params, omitted_feature_content, plan_dict, plan_key=new_plan_key, depth=this_depth, data_pfx=data_name, plan_pfx=plan_name)
-    """
+
+        steps = build_plan_tree(
+            args,
+            omitted_feature_content,
+            subplan_id=new_subplan_id,
+            depth=curr_depth,
+            data_pfx=data_name,
+            plan_pfx=plan_name
+        )
     return
+    """
 
 def write_file(fname, title, string_list):
     """ write text expressed as an array of lines to file """
@@ -314,17 +393,16 @@ def write_file(fname, title, string_list):
         for line in string_list:
             f.write(line)
 
-def write_dict_to_json(dictionary, fname): 
+def write_dict_to_json(dictionary, fname):
     """ write dictionary to a json file """
     with open(fname, 'w') as f:
         json.dump(dictionary, f)
-    with open(fname, 'r') as f:
-        new_dict = json.load(f)
 
 #----------------------------------------------------------------------------------
-# MAINLINE
+# various hard-coded lists, test cases - the synthetic feature-sets remain useful
 #----------------------------------------------------------------------------------
 
+""" 
 synthetic_cell_names = ['cell_' + '%04d' % (x) for x in range(4)]
 synthetic_drug_names = ['drug_' + '%04d' % (x) for x in range(4)]
 
@@ -350,47 +428,46 @@ drug_names = [
     'NSC.82151'
 ]
 
+generator = WindowsSubsetGenerator()
 
-#working_dir = get_working_dir()
-working_dir = './'
-generator = QuadrantSubsetGenerator(working_dir)
-
-# sublist test -------------
-"""
 cell_sublists = generator.partition(cell_names, count=2, name='Cells')
 print(cell_sublists)
 drug_sublists = generator.partition(drug_names, count=3, name='Drug')
 print(drug_sublists)
 """
-# sublist test -------------
 
+#----------------------------------------------------------------------------------
+# mainline 
+#----------------------------------------------------------------------------------
 
-#nbr_feature_sets, feature_set_names, feature_set_paths = get_feature_set_info(working_dir)
-
+# Acquire and validate arguments
 args = planargs.parse_arguments()
+feature_set_content = validate_args(args)        # returns a list of feature-set lists
 
-nbr_feature_sets = 2
-feature_set_names = ['CELL', 'DRUG']
-partition_spec = [2, 2]
-feature_set_paths = []
+# feature_set_content = [cell_names, drug_names] 
+# feature_set_content = [synthetic_cell_names, synthetic_drug_names]
 
-params = {}
-params['working_dir'] = working_dir
-params['nbr_feature_sets'] = nbr_feature_sets
-params['feature_set_names'] = feature_set_names
-params['feature_set_paths'] = feature_set_paths
-params['partition_spec'] = partition_spec
-params['total_steps'] = 0
-params['verbose'] = True
+# Plan generation 
+data_fname_pfx = os.path.join(args.out_dir, 'DATA.1')
+plan_fname_pfx = os.path.join(args.out_dir, 'PLAN.1')
 
-feature_set_content = [cell_names, drug_names]          # synthetic 
-plan_dict = {}
+args.json = True                                # the only available option thus far
+args.plan_dict = {}
 
-build_tree(generator, params, feature_set_content, plan_dict, plan_key='1', data_pfx='~/treetest/DATA.1', plan_pfx='~/treetest/PLAN.1')
+steps = build_plan_tree(
+    args,                                       # command linee argument namespace
+    feature_set_content,                        # for example [[cell1 ... celln] [drug1 ... drugn]]
+    subplan_id='1',                             # name of root plan, subplan names created from this stem
+    data_pfx=data_fname_pfx,                    # DATA file prefix, building block for feature name files
+    plan_pfx=plan_fname_pfx                     # PLAN file prefix, building block for plan name files
+)
 
-print("Plan complete, total steps: %d" % params['total_steps'])
-pp(plan_dict, width=160)
-write_dict_to_json(plan_dict, 'dq_plan.json')
-write_file('json_plan', 'JSON plan file', [jstring])
+print("Plan generation complete, total steps: %d" %  steps)
+
+if args.json:
+    write_dict_to_json(args.plan_dict, 'need_a_name_plan.json')      # ??????????????????????
+
+if args.verbose:
+    pp(args.plan_dict, width=160)
 
 
