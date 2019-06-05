@@ -274,35 +274,51 @@ def breakout(seq_list, names):
 def build_plan_tree(args, feature_set_content, subplan_id='', depth=0, data_pfx='', plan_pfx=''):
     """ recursive plan generation"""
     curr_depth = depth + 1
-    flat_partitions = []
     all_parts = []
-    files = []
-    sequence = 0
+    successful_splits = 0
+
+    #flat_partitions = []
+    #files = []
+    #sequence = 0
 
     for i in range(len(args.fs_names)):
         group = feature_set_content[i]
         count = args.fs_parts[i]
         feature_set_name = args.fs_names[i]
         partitions = args.generator.partition(feature_set_content[i], count=count)   # name= ??????????????
-#       print(partitions)
 
+        if args.debug:
+            print(partitions)
+       
         if len(partitions) == 0:
-            return 0 # ??????????????????????????????????????? fix this per M 
+            return 0    #??????????????????????
+       
 
+        if len(partitions) > 0:                     # partitioning successful?
+            successful_splits += 1                  # successful split
+        else:
+            partitions = feature_set_content[i]     # reuse original small slice 
         all_parts.append(partitions)
 
+
+    # if no further partitioning is possible task is complete
+    if successful_splits == 0:
+        return 0
+
+    # acquire a cross-product of all feature-set partitions
     parts_xprod = np.array(list(it.product(*all_parts)))
     steps = len(parts_xprod)
     substeps = 0
 
     for plan_id in range(steps):
         train = []
+        val = []
 
         # split into validation and training components
         for i, plan in enumerate(parts_xprod):
             section = breakout(plan, args.fs_names)
             if i == plan_id:
-                val = section
+                val.append(section)
             else:
                 train.append(section)
 
