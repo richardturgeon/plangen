@@ -31,10 +31,6 @@ def parse_arguments():
                         action='store_true',
                         help='Accept non-empty out_dir, contents overwritten')
 
-    parser.add_argument('--verbose',
-                        action='store_true',
-                        help='Trace execution')
-
     parser.add_argument ('--partition_strategy',
                         choices=partitioning_strategies,
                         default=partitioning_strategies[0],
@@ -60,6 +56,14 @@ def parse_arguments():
                         type=int,
                         nargs='+',
                         help='Specify a list of partition counts')
+
+    parser.add_argument('--verbose',
+                        action='store_true',
+                        help='Verbosity')
+
+    parser.add_argument('--debug',
+                        action='store_true',
+                        help='Data structure dumps, etc')
 
     args= parser.parse_args()
     return args

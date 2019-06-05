@@ -11,11 +11,11 @@ from abc import ABC, abstractmethod     # abstract class support
 from scipy.special import comb
 from pprint import pprint as pp
 
-
 def isempty(path):
     """Determine whether the given directory is empty."""
     flist = glob.glob(os.path.join(path,'*'))
     return flist == []
+
 
 def validate_args(args):
     """Validate the execution arguments as defined in planargs.py.
@@ -271,8 +271,8 @@ def breakout(seq_list, names):
     return dict
 
 
-def build_plan_tree(args, feature_set_content, subplan_id=None, depth=0, data_pfx='', plan_pfx=''):
-    """ """
+def build_plan_tree(args, feature_set_content, subplan_id='', depth=0, data_pfx='', plan_pfx=''):
+    """ recursive plan generation"""
     curr_depth = depth + 1
     flat_partitions = []
     all_parts = []
@@ -326,6 +326,7 @@ def build_plan_tree(args, feature_set_content, subplan_id=None, depth=0, data_pf
 
     """
     # THIS IS A WORK-IN-PROGRESS ... GENERATING FILES FOR DATA AND PLAN
+
         files.append([])
         files_ndx = len(files) - 1
 
@@ -341,8 +342,7 @@ def build_plan_tree(args, feature_set_content, subplan_id=None, depth=0, data_pf
             #write_file(file_name, part)
             pair = (feature_set_name, file_name)
             files[files_ndx].append(pair)
-    """
-    """
+
     file_xprod = np.array(list(it.product(*files)))
     nbr_plans = len(file_xprod)
 
@@ -465,9 +465,11 @@ steps = build_plan_tree(
 print("Plan generation complete, total steps: %d" %  steps)
 
 if args.json:
-    write_dict_to_json(args.plan_dict, 'need_a_name_plan.json')      # ??????????????????????
+    json_file_name = os.path.join(args.out_dir, 'plangen.json')
+    json_abspath = os.path.abspath(json_file_name)
+    write_dict_to_json(args.plan_dict, json_abspath) 
+    print("%s JSON file written" % json_abspath)
 
-if args.verbose:
+if args.debug:
     pp(args.plan_dict, width=160)
-
 
