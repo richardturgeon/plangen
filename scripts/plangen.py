@@ -249,8 +249,8 @@ class WindowsSubsetGenerator(SubsetGenerator):
     def partition(self, base, size='n/a', count=1, name=None):
         """ partition list return sublists"""
         base_len = len(base)
-        if base_len < count:
-            return []
+        if base_len < count:            # can partition any further?
+            return [base]               # document this ???????????????????????? 
 
         size = int((base_len / count) + .9)
         sublists = []
@@ -286,20 +286,18 @@ def build_plan_tree(args, feature_set_content, subplan_id='', depth=0, data_pfx=
         count = args.fs_parts[i]
         feature_set_name = args.fs_names[i]
         partitions = args.generator.partition(feature_set_content[i], count=count)   # name= ??????????????
-
+        
         if args.debug:
-            print(partitions)
-       
-        if len(partitions) == 0:
+            pp(partitions)
+      
+        """
+        if len(partitions) <= 1:
             return 0    #??????????????????????
-       
-
-        if len(partitions) > 0:                     # partitioning successful?
+        """
+        if len(partitions) > 1:                     # partitioning successful?
             successful_splits += 1                  # successful split
-        else:
-            partitions = feature_set_content[i]     # reuse original small slice 
-        all_parts.append(partitions)
 
+        all_parts.append(partitions)
 
     # if no further partitioning is possible task is complete
     if successful_splits == 0:
