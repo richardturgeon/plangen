@@ -65,6 +65,10 @@ def parse_arguments():
                         action='store_true',
                         help='Data structure dumps, etc')
 
+    parser.add_argument('--test',
+                        action='store_true',
+                        help='Test plan navigation and entry retrieval')
+
     args= parser.parse_args()
     return args
 
