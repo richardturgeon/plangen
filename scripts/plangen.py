@@ -1,11 +1,16 @@
 
+from collections import namedtuple
+from enum import Enum
 import glob
 import itertools as it
 import json
 import numpy as np
 import os
-import planargs
 import sys
+import sqlite3 
+from sqlite3 import Error as db_Error
+
+import planargs
 
 from abc import ABC, abstractmethod     # abstract class support
 from collections import OrderedDict
@@ -42,7 +47,7 @@ def validate_args(args):
     fs_paths. Otherwise, feature-set files must be fully specified. Each of the
     files is read and returned.
 
-    Returns:
+    Returns
         Upon success, a tuple is returned. It contains:
 
             t[0] - the generator class implementing the appropriate partition()
@@ -121,7 +126,7 @@ def validate_args(args):
 
     # construct a partitioning object exporting a partion() function
     if args.partition_strategy == 'windows':
-        generator = WindowsSubsetGenerator()
+        generator = LeaveoutSubsetGenerator()
     # return feature-set contents lists
     return generator, fs_content
 
@@ -241,7 +246,7 @@ class IterativeSubsetGenerator(SubsetGenerator):
         return selected_sublists
 
 
-class WindowsSubsetGenerator(SubsetGenerator):
+class LeaveoutSubsetGenerator(SubsetGenerator):
     """CANDLE milestone 13 style feature set partitioning.
 
     All SubsetGenerator subclasses are required to implement partition(),
@@ -249,20 +254,20 @@ class WindowsSubsetGenerator(SubsetGenerator):
     """
 
     def __init__(self):
-        SubsetGenerator.__init__(self, 'WindowsSubsetGenerator')
-        self.strategy = "windows"
+        SubsetGenerator.__init__(self, 'LeaveoutSubsetGenerator')
+        self.strategy = "leaveout"
 
     def plan_init(self, fs_names, fs_paths, fs_lines, fs_parts, root_name='1'):
         """Initialize - collect plan metadata """
         currtime = datetime.now()
         details = {'fs_names': fs_names, 'fs_filepaths':fs_paths, 'fs_parts': fs_parts}
-        details['create_date'] = currtime.strftime("%m/%d/%Y-%H:%M:S")
+        details['create_date'] = currtime.strftime("%m/%d/%Y-%H:%M:%S")
         details['strategy'] = self.strategy
 
         label = ''
         for i in range(len(fs_names)):
             if i != 0:
-                label += '.'
+                label += '_'
             s = '{}{}-p{}'.format(fs_names[i], fs_lines[i], fs_parts[i])
             label += s
 
@@ -271,10 +276,10 @@ class WindowsSubsetGenerator(SubsetGenerator):
         plan_dict[root_name] = details
         return root_name, plan_dict
 
-    def plan_term(self, plan_dict, root_name, nbr_nodes):
+    def plan_term(self, plan_dict, root_name, nbr_subplans):
         """Completion - post plan summary  metadata """
         meta = plan_dict[root_name]
-        meta['nodes'] = nbr_nodes
+        meta['nbr_subplans'] = nbr_subplans
 
 
     def partition(self, base, size='n/a', count=None, name=None):
@@ -285,7 +290,7 @@ class WindowsSubsetGenerator(SubsetGenerator):
         The last sublist will contain fewer elements if the base list cannot
         be evenly divided.
 
-        Args:
+        Args
             base:   A list of feature-set names.
             size:   Ignored, not used in this implementation.
             count:  The number of equal sized partitions requested.
@@ -296,7 +301,7 @@ class WindowsSubsetGenerator(SubsetGenerator):
             These arguments are common to all partition functions defined in
             SubsetGenerator subclasses.
 
-        Returns:
+        Returns
             When the input 'base' list contains a number of entries equal to or
             greater than 'count', a list of 'count' sublists is returned. For
             example:
@@ -322,6 +327,512 @@ class WindowsSubsetGenerator(SubsetGenerator):
         return sublists
 
 #------------------------------------------------------------------------------
+# Database support, table and column definitions, DDL and DML
+# Refer to the plan_prep() function for a discussion of the "planstat" and
+# "runhist" tables defined below.
+#------------------------------------------------------------------------------
+
+class RunType(Enum):
+    RUN_ALL = 0
+    RESTART = 1
+
+class RunStat(Enum):        # subplan execution status
+    SCHEDULED = 'scheduled'
+    COMPLETE  = 'complete'
+
+# planstat table, rows are returned via the PlanstatRow namedtuple
+
+_planstat_ddl = """
+    CREATE TABLE IF NOT EXISTS planstat (
+        plan_name       TEXT NOT NULL PRIMARY KEY,
+        create_date     TEXT NOT NULL,
+        feature_sets    TEXT NOT NULL,
+        partitions      TEXT NOT NULL,
+        nbr_subplans    INTEGER
+    ); """
+
+PlanstatRow = namedtuple('PlanstatRow',
+    [
+        'rowid',
+        'plan_name',
+        'create_date',
+        'feature_sets',
+        'partitions',
+        'nbr_subplans'
+    ]
+)
+
+_select_row_from_planstat = """
+    SELECT rowid, 
+        plan_name, create_date, feature_sets, partitions, nbr_subplans
+        FROM planstat
+        WHERE plan_name='{}'
+    """
+
+_insert_planstat_plan = """
+    INSERT INTO planstat (
+        plan_name, create_date, feature_sets, partitions, nbr_subplans)
+    VALUES ('{}', '{}', '{}', '{}', {})
+    """
+
+_delete_planstat_plan = """
+    DELETE FROM planstat where rowid = {}
+    """
+
+# runhist table, rows are returned via the RunhistRow namedtuple
+
+_runhist_ddl = """
+    CREATE TABLE IF NOT EXISTS runhist (
+        plan_id         INTEGER NOT NULL,
+        subplan_id      TEXT NOT NULL,
+        status          TEXT NOT NULL,
+        start_time      TEXT NOT NULL,
+        stop_time       TEXT,
+        mae             REAL,
+        mse             REAL,
+        r_square        REAL,
+        weights_fn      TEXT,
+        PRIMARY KEY (plan_id, subplan_id)
+    ); """
+
+RunhistRow = namedtuple('RunhistRow',
+    [
+        'plan_id',
+        'subplan_id',
+        'status',
+        'start_time',
+        'stop_time',
+        'mae',
+        'mse',
+        'r_square',
+        'weights_fn'
+    ]
+)
+
+_select_row_from_runhist = """
+    SELECT plan_id, subplan_id, status, start_time, stop_time, mae, mse, r_square, weights_fn
+    FROM runhist
+    WHERE plan_id = {} and subplan_id = '{}'
+    """
+
+_insupd_scheduled_runhist = """
+    REPLACE INTO runhist(plan_id, subplan_id, status, start_time,
+        stop_time, mae, mse, r_square, weights_fn)
+    VALUES({}, '{}', '{}', '{}',
+        NULL, NULL, NULL, NULL, NULL)
+    """
+
+_insupd_completed_runhist = """
+    UPDATE runhist SET
+        status = '{}',
+        stop_time = '{}',
+        mae = {},
+        mse = {},
+        r_square = {},
+        weights_fn = '{}'
+    WHERE
+        plan_id = {} AND subplan_id='{}'
+     """
+
+_delete_from_runhistory = """
+    DELETE FROM runhist where plan_id = {}
+    """
+
+#------------------------------------------------------------------------------
+# "Plan management" Database functions
+#
+#   db_connect          - establish database connection returning conn handle     
+#   execute_sql_stmt    - execute a SQL statement with optional error trap   
+#   plan_prep           - prepare for the execution of a multi-step "plan"
+#   start_subplan       - start a subplan, (ex. '1.4.8'), write RunHistRow  
+#   stop_subplan        - stop a subplan, update RunHistRow 
+#   get_subplan_runhist - return a RunHistRow for a given subplan 
+#   plan_remove         - remove all database records for the named plan
+#------------------------------------------------------------------------------
+
+def execute_sql_stmt(conn, stmt, cursor=None, trap_exception=False):
+    """Execute a SQL statement.
+
+    This is a convenience function that wraps the execution of a given SQL
+    statement with exception handling and cleanup logic.
+
+    Args
+        conn:           An open database connection handle
+        stmt:           A fully instantiated SQL statement
+
+        cursor:         Optionally, a cursor managed by the caller. If
+                        local cursor is used. Provide a cursor if you must
+                        operate on it after completion, fetchall() for example.
+
+        trap_exception: By default exceptions raised by the database must be
+                        handled by the caller. If True, errors are reflected
+                        by the boolean return value and the cursor and/or
+                        connection handle provided by the caller are closed..
+
+    Returns
+        False indicates that an exception occurred, else True.
+    """
+
+    if cursor:
+        lclcsr = cursor
+    else:
+        lclcsr = conn.cursor()
+    try:
+        db_exception = False
+        lclcsr.execute(stmt)
+
+    except db_Error as e:
+        db_exception = True
+        print('execute_sql_stmt:', stmt)
+        print('execute_sql_stmt:', e)
+        if not trap_exception:
+            raise
+    finally:
+        if not cursor:
+            lclcsr.close()
+
+        if db_exception:
+            if cursor:
+                cursor.close()
+            conn.close()
+
+    return not db_exception
+
+
+def db_connect(db_path):
+    """Connect to the plan management database.
+
+    Establish a connection to the sqlite3 database contained in the named file.
+    A plan management database is created and populated at db_path if the file 
+    does not exist.
+
+    Args
+        db_path:    A relative or absolute path or ":memory:"
+
+    Returns
+        A connection handle is returned upon success, else None
+    """
+
+    if db_path == ':memory:' or not os.path.exists(db_path):
+        prev_allocated = False
+    else:
+        prev_allocated = True
+
+    try:
+        conn = sqlite3.connect(db_path)
+    except db_Error as error:
+        print('db_connect', error)
+        raise
+
+    # create plan management tables on initial database allocation 
+    if conn and not prev_allocated:
+        complete  = execute_sql_stmt(conn, _planstat_ddl)
+        complete &= execute_sql_stmt(conn, _runhist_ddl)
+
+        if complete:
+            conn.commit()
+        else:
+            conn.close()
+            conn = None
+    return conn
+
+
+def plan_remove(db_path, plan_path):
+    """Delete the named plan from the plan managment database.
+
+    The relative plan name is extracted from the plan_path by removing the
+    leading directories and the trailing filetype suffix from the given
+    plan_path. The planstat row is retrieved and the associated rowid is
+    the plan_id identifying the target runhist table rows. 
+
+    Returns
+        Zero indicates deletion complete, -1 if the plan name is not matched.
+    """
+
+    status = 0
+    conn = db_connect(db_path)
+    plan_key = _get_planstat_key(plan_path)
+    stmt = _select_row_from_planstat.format(plan_key)
+    csr  = conn.cursor()
+    execute_sql_stmt(conn, stmt, cursor=csr)
+    nrow = csr.rowcount
+    row  = csr.fetchone()
+
+    print("%d run history rows deleted" % nrow)
+
+    if not row:
+        print("Error: CLEANUP request failed - %s has not been run" % plan_key)
+        status = -1
+    else:
+        plan_rec = PlanstatRow._make(row)           # column-name addressable
+        rowid = plan_rec.rowid                      # the unique rowid is the plan uniquifier
+        _delete_runhistory(conn, rowid)
+        stmt = _delete_planstat_plan.format(rowid)
+        status = execute_sql_stmt(conn, stmt)
+
+    csr.close()
+    conn.close()
+    return status
+
+
+def plan_prep(db_path, plan_path, run_type=RunType.RUN_ALL):
+    """Prepare to run a plan, a hierarchy of interdependent subplans.
+
+    Plans names and related information are stored in the planstat (PLAN STATUS)
+    table. There is one row for each plan submitted. A positive, unique integer
+    called the 'rowid' is assigned to table rows by the database manager. The
+    rowid of a planstat table row is defined here as the "plan_id". The plan_id
+    together with a textual "subplan_id" (example: '1.2.4') form a composite
+    key that is the primary key of the runhist (RUN HISTORY) table. The purpose
+    of this function is to register the plan and return the associated plan_id.
+
+    RunTypes
+        When a new plan is presented it is registered in the planstat table and
+        during its execution a large number of runhist (RUN HISTORY) table
+        entries are created and then updated. To prevent unintended loss of
+        data one of thethe following "RunTypes" is specified on the initial
+        plan_prep() call and again on subsequent subplan_start() calls.
+
+        Specify RUN_ALL on the first attempt to run a plan. If the plan name
+        is already registered, the request fails and neither the planstat or
+        runstat tables are changed.
+
+        Specify RESTART if a prior attempt to run a plan did not complete. The
+        presence of a corresponding planstat record is verified. subplan_start()
+        returns a SKIP status if the associated runhist row (if any) is marked
+        COMPLETE.
+
+    Args
+        db_path:        plan management database path (relative or absolute)
+        plan_path:      JSON plan file (relative or absolute)
+        run_type:       RunType.RUN_ALL, the default, or RunType.RESTART
+
+    Returns
+        A negative value indicates a fatal error.
+
+        Otherwise the integer returned is the plan_id used together with a
+        subplan_id string used in subsequent subplan_start(), subplan_stop()
+        and get_subplan_hist() calls.
+    """
+
+    # load the plan and retrieve identity info
+    plan_dict    = load_plan(plan_path)
+    create_date  = get_plan_create_date(plan_dict)
+    feature_sets = get_plan_fs_names(plan_dict)
+    partitions   = get_plan_fs_parts(plan_dict)
+    nbr_subplans    = get_plan_nbr_subplans(plan_dict)
+
+    # de    termine if a plan of the given name has already been registered 
+    conn = db_connect(db_path)
+    plan_key = _get_planstat_key(plan_path)
+    stmt = _select_row_from_planstat.format(plan_key)
+    csr  = conn.cursor()
+    execute_sql_stmt(conn, stmt, cursor=csr)
+    row  = csr.fetchone()
+
+    if not row:
+        rowid = -1
+    else:
+        plan_rec = PlanstatRow._make(row)           # column-name addressable
+        rowid = plan_rec.rowid                      # the unique rowid will be the uniquifier returned
+
+    # compare run_type to initial expectations  
+    error = False
+
+    if run_type == RunType.RUN_ALL and rowid > 0:
+        print("Error: RUN_ALL specified but plan: %s has already been defined" %  plan_key)
+        error = True
+
+    elif run_type == RunType.RESTART and rowid < 0:
+        print("Error: RESTART specified but plan: %s has not been previously run" % plan_key)
+        error = True
+
+    elif rowid > 0 and create_date != create_date:  # DEBUG ???????????????????????????????????? plan_rec.create_date:
+        print("Error: RESTART specified but the signature of the previously defined plan: %s does not match" % plan_key)
+        error = True
+
+    # register new plans acquiring the uniquifying plan_id used to compose runhistory table keys
+    if not error and rowid < 0:
+        feature_sets = str(feature_sets)
+        feature_sets = feature_sets.replace("'", "") # create string literal from list of str
+        partitions   = str(partitions)               # create string literal from list of int
+
+        stmt = _insert_planstat_plan.format(
+            plan_key,
+            create_date,
+            feature_sets,
+            partitions,
+            nbr_subplans
+        )
+
+        status = execute_sql_stmt(conn, stmt, cursor=csr)
+        rowid = csr.lastrowid
+
+    # cleanup resources and return uniquifier or error indicator    
+    csr.close()
+    conn.commit()
+
+    if error:
+        return -1
+    else:
+        return rowid
+
+
+def start_subplan(db_path, plan_path, plan_id=None, subplan_id=None, run_type=None):
+    """Schedule the execution of a subplan.
+
+    This function writes a RunHistRow record to the runhist table indicating that
+    the named plan/subplan has been SCHEDULED. The row includes the "start time".
+    If the given run_type is RESTART, it is possible that the subplan has already
+    run, as indicated by the status returned.
+
+    Args
+        db_path:        plan management database path (relative or absolute)
+        plan_path:      JSON plan file (relative or absolute)
+        plan_id:        the plan identifier returned by plan_prep()
+        subplan_id      the subplan identifier ex. '1 4.8'
+        run_type:       RunType.RUN_ALL or RunType.RESTART
+
+    Returns
+        Zero indicates that a RunHistRow record has been created to represent
+        the subplan. -1 is returned from a RESTART call if the a RunHistRow
+        already exists for the plan/subplan and is marked COMPLETE.
+    """
+
+    conn = db_connect(db_path)
+    csr  = conn.cursor()
+    skip = False
+
+    # skip previously completed work if RESTART
+    if run_type == RunType.RESTART:
+        stmt = _select_row_from_runhist.format(plan_id, subplan_id)
+        execute_sql_stmt(conn, stmt, cursor=csr)
+        row = csr.fetchone()
+
+        if row:
+            plan_rec = RunhistRow._make(row)
+            if plan_rec.status == RunStat.COMPLETE.name:
+                skip = True
+
+    # construct/reinit a new runhist record 
+    if not skip:
+        currtime = datetime.now()
+        start_time = currtime.strftime("%m/%d/%Y-%H:%M:%S")
+
+        stmt = _insupd_scheduled_runhist.format(
+            plan_id,
+            subplan_id,
+            RunStat.SCHEDULED.name,
+            start_time
+        )
+
+        execute_sql_stmt(conn, stmt, cursor=csr)
+
+    csr.close()
+    conn.commit()
+    conn.close()
+
+    if skip:
+        return -1
+    else:
+        return 0
+
+
+def stop_subplan(db_path, plan_id=None, subplan_id=None, comp_info_dict={}):
+    """Complete the execution of a subplan.
+
+    This function updates the RunHistRow record created by start_subplan()
+    updating the status to COMPLETE, the completion timestamp, and "user
+    fields" (such as MAE, MSE, R2) returned by the model.
+
+    A comp_dict dictionary is populated with the names and default values
+    for columns implemented in the RunHistRow table. Values matching those
+    names are extracted from the comp_info_dict are written to the table. 
+
+    TODO It might be nice to take all of the unmatched fields from comp_info_dict
+    and write them into a single RunHistRow text field as key=value, ...
+
+    Args
+        db_path:        plan management database path (relative or absolute)
+        plan_path:      JSON plan file (relative or absolute)
+        plan_id:        the plan identifier returned by plan_prep()
+        comp_info_dict: supplemental completion data dictionar
+    """
+
+    conn = db_connect(db_path)
+    currtime = datetime.now()
+    stop_time = currtime.strftime("%m/%d/%Y-%H:%M:%S")
+
+    comp_dict = dict(mae=0.0, mse=0.0, r_square=0.0, weights_fn='N/A')
+    _acquire_actuals(comp_dict, comp_info_dict)
+
+    stmt = _insupd_completed_runhist.format(
+    # column values
+        RunStat.COMPLETE.name,
+        stop_time,
+        comp_dict['mae'],
+        comp_dict['mse'],
+        comp_dict['r_square'],
+        comp_dict['weights_fn'],
+    # key spec    
+        plan_id,
+        subplan_id
+    )
+
+    execute_sql_stmt(conn, stmt)
+    conn.commit()
+    conn.close()
+
+
+def get_subplan_runhist(db_path, plan_id=None, subplan_id=None):
+    """Return the RunHistRow record for a given plan/subplan.
+
+    Args
+        db_path:        plan management database path (relative or absolute)
+        plan_id:        the plan identifier returned by plan_prep()
+        subplan_id      the subplan identifier ex. '1 4.8'
+
+    Returns
+        The RunHistRow associated with the given plan/subplan is returned if
+        found.
+    """
+    conn = db_connect(db_path)
+    stmt = _select_row_from_runhist.format(plan_id, subplan_id)
+    csr  = conn.cursor()
+    execute_sql_stmt(conn, stmt, csr)
+    row = csr.fetchone()
+
+    if not row:
+        plan_rec = None
+    else:
+        plan_rec = RunhistRow._make(row)
+
+    return plan_rec
+
+def _acquire_actuals(dft_dict, actuals_dict):
+    for key, value in dft_dict.items():
+        if key in actuals_dict:
+            dft_dict[key] = actuals_dict[key]
+
+def _get_planstat_key(plan_path):
+    """Extract the name portion of a plan from a filepath."""
+    basename = os.path.basename(plan_path)
+    basepfx = basename.split(sep='.')
+    return basepfx[0]
+
+
+def _delete_runhistory(conn, plan_id):
+    """Delete RunHistRows containing the given plan_id."""
+    csr  = conn.cursor()
+    stmt = _delete_from_runhistory.format(plan_id)
+    execute_sql_stmt(conn, stmt, cursor=csr, trap_exception=True)
+    rowcount = csr.rowcount
+    print("CLEANUP processing removed %d run history records" % rowcount)
+    csr.close()
+    return rowcount
+
+
+#------------------------------------------------------------------------------
 # Plan navigation, content retrieval 
 #------------------------------------------------------------------------------
 
@@ -332,10 +843,10 @@ def load_plan(filepath):
     the entry order imposed when the plan was created. This allows the root entry
     to be easily located regardless of the plan entry naming scheme in use.
 
-    Args:
+    Args
         filepath:   A relative or absolute path to the JSON file.
 
-    Returns:
+    Returns
         An entry-ordered plan in OrderedDict format is returned.
     """
 
@@ -343,69 +854,87 @@ def load_plan(filepath):
         ordered_plan_dict = json.load(f, object_pairs_hook=OrderedDict)
     return ordered_plan_dict
 
+def get_plan_create_date(plan_dict):
+    _, value = _get_first_entry(plan_dict)
+    return value['create_date']
 
-def get_node(plan_dict, node_name=None):
-    """Retrieve the content of a named plan node or the root node.
+def get_plan_fs_names(plan_dict):
+    _, value = _get_first_entry(plan_dict)
+    return value['fs_names']
 
-    Args:
+def get_plan_fs_parts(plan_dict):
+    _, value = _get_first_entry(plan_dict)
+    return value['fs_parts']
+
+def get_plan_nbr_subplans(plan_dict):
+    _, value = _get_first_entry(plan_dict)
+    return value['nbr_subplans']
+
+def _get_first_entry(ordered_dict):
+    key, value = next(iter(ordered_dict.items()))
+    return key, value
+
+def get_subplan(plan_dict, subplan_id=None):
+    """Retrieve the content of a named subplan or the root plan.
+
+    Args
         plan_dict:      The plan dictionary as returned by load_plan().
-        node_name:      The name of the desired node. Omit this arg to acquire
-                        the content and name of the plan tree root node.
+        subplan_id:     The name of the desired subplan. Omit this arg to acquire
+                        the content and name of the plan tree root.
 
-    Returns:
-        A (content, node_name) pair is returned. The returned name is useful when
-        using default arguments to retrieve the root node.
+    Returns
+        A (content, subplan_id) pair is returned. The returned name is useful when
+        using default arguments to retrieve the root plan.
     """
 
-    if node_name is None:
-        node_name, content = next(iter(plan_dict.items()))
+    if subplan_id is None:
+        subplan_id, content = _get_first_entry(plan_dict)
     else:
-        content = plan_dict.get(node_name)
-    return content, node_name
+        content = plan_dict.get(subplan_id)
+    return content, subplan_id
 
 
-def get_predecessor(plan_dict, node_name):
-    """Acquire the name of the predecessor (parent) of a given node.
+def get_predecessor(plan_dict, subplan_id):
+    """Acquire the name of the predecessor (parent) of a given subplan.
 
-    The plan tree is a true tree. All nodes except for the root have
-    exactly one predecessor / parent. Use this function to walk 'up'
-    the tree.
+    The plan tree is a true tree. All subplans have exactly one
+    predecessor/parent. Use this function to walk 'up' the tree.
 
-    Args:
+    Args
         plan_dict:      The plan dictionary as returned by load_plan().
-        node_name:      The name of the target node (often the current node).
+        subplan_id:     The name of the target subplan.
 
-    Returns:
-        The name of the parent node is returned. If the root node_name is
-        specified None is returned.
+    Returns
+        The name of the parent subplan is returned. If the root plan name
+        is specified None is returned.
     """
 
-    segments = node_name.split(sep='.')
+    segments = subplan_id.split(sep='.')
     if len(segments) <= 1:
-        node_name = None
+        subplan_id = None
     else:
         segments.pop()
-        node_name = '.'.join(segments)
-    return node_name
+        subplan_id = '.'.join(segments)
+    return subplan_id
 
 
-def get_successors(plan_dict, node_name):
-    """Acquire the names of the successors (children) of a given node.
+def get_successors(plan_dict, subplan_id):
+    """Acquire the names of the successors (children) of a given subplan.
 
-    All nodes other than 'leaf' nodes have at least one successor. Use
+    All subplans other than 'leaf' subplans have at least one successor. Use
     this function to walk 'down' one or more plan subtrees.
 
-    Args:
+    Args
         plan_dict:      The plan dictionary as returned by load_plan().
-        node_name:      The name of the target node (often the current node).
+        subplan_id:     The name of the target subplan.
 
-    Returns:
-        A list of the names of all successors (children) of the given node
+    Returns
+        A list of the names of all successors (children) of the given subplan
         is returned. The list may be empty.
     """
     successor_names = []
     for i in it.count(start=1):
-        new_name = node_name + '.' + str(i)
+        new_name = subplan_id + '.' + str(i)
         value = plan_dict.get(new_name)
         if not value:
             break
@@ -458,11 +987,11 @@ def build_plan_tree(args, feature_set_content, parent_plan_id='', depth=0, data_
         data_pfx:   Reserved for constructing feature-set name files.
         plan_pfx:   Reserved for constructing plan control files.
 
-    Returns:
+    Returns
         args.plan_dict contains a dictionary representing the plan. This may be
         JSONized.
 
-        The number of planning steps (nbr of nodes in the plan tree) is explicitly
+        The number of planning steps (nbr of subplans in the plan tree) is explicitly
         returned.
     """
     curr_depth = depth + 1
@@ -646,7 +1175,7 @@ def main():
 
     if args.json:
         label = args.generator.get_plan_label(args.plan_dict, root_name)
-        qualified_name = 'plangen.' + label + '.json'
+        qualified_name = 'plangen_' + label + '.json'
         json_file_name = os.path.join(args.out_dir, qualified_name)
         json_abspath = os.path.abspath(json_file_name)
         write_dict_to_json(args.plan_dict, json_abspath)
@@ -659,25 +1188,33 @@ def main():
         test(json_abspath)
 
 #----------------------------------------------------------------------------------
-# test plan navigation and plan entry (node) retrieval
+# test plan navigation and subplan entry retrieval
 #----------------------------------------------------------------------------------
 
 def test(plan_path):
-    print("\nBegin plan navigation and node retrieval test")
+    db_path = "test_sql_database"
+    run_type = RunType.RESTART
+
+    plan_id = plan_prep(db_path, "plangen_cell8-p2_drug8-p2.json", run_type)
+
+    if (plan_id < 0):
+        sys.exit("Terminating due to database detected error")
+
+    print("\nBegin plan navigation and subplan retrieval test")
     plan_dict = load_plan(plan_path)
 
-    # plan root node name, value returned when node_name= is omitted
-    metadata, root_name = get_node(plan_dict)
+    # plan root name, value returned when subplan_id= is omitted
+    metadata, root_name = get_subplan(plan_dict)
 
-    # the root node has no parent / predecessor
+    # the root has no parent / predecessor
     parent_name = get_predecessor(plan_dict, root_name)
-    print("Demonstrate that root predecessir is not definede: %s" % parent_name)
+    print("Demonstrate that root \'%s\' predecessor is not defined: %s" % (root_name, parent_name))
 
-    # the root node contains metadata, it is not a run specification
+    # the root contains metadata, it is not a run specification
     successor_names = get_successors(plan_dict, root_name)
     print("\nThe first runable configurations are defined in %s\n" % successor_names)
 
-    # the root node is the predecessor of these first level runables
+    # the root is the predecessor of these first level runables
     for sname in successor_names:
         parent_name = get_predecessor(plan_dict, sname)
         print("The parent of %s is %s" % (sname, parent_name))
@@ -688,12 +1225,24 @@ def test(plan_path):
         listlen = len(successor_names)
         if listlen == 0:
             break
+
+        for name in successor_names:
+            status = start_subplan(
+                db_path,
+                plan_path,
+                plan_id=plan_id,
+                subplan_id=name,
+                run_type=run_type
+            )
+
+            if status < 0:
+                print("subplan: %s skipped, previously processed" % name)
+
         select_one  = successor_names[listlen - 1]
         parent_name = get_predecessor(plan_dict, select_one)
         print("%-16s is a successor of %-16s - all successors: %s" % (select_one, parent_name, successor_names))
-        successor_names = get_successors(plan_dict, select_one)
 
-        value,_  = get_node(plan_dict, select_one)
+        value,_ = get_subplan(plan_dict, select_one)
         train_set, validation_set = parse_plan_entry(value)
 
         # print the coarsely parsed plan entry train/validation components
@@ -704,7 +1253,24 @@ def test(plan_path):
             pp(validation_set, width=160)
             print(" ")
 
+        # test retrieval api
+        row = get_subplan_runhist(db_path, plan_id=plan_id, subplan_id=select_one)
+        print(row)
+
+        # post subplan termination
+        completion_status = dict(mse=1.1, mae=2.2, r_square=.555)
+
+        stop_subplan(
+            db_path,
+            plan_id=plan_id,
+            subplan_id=select_one,
+            comp_info_dict=completion_status
+        )
+
+        successor_names = get_successors(plan_dict, select_one)
+
     print("\nEnd of branch reached")
+#   plan_remove(db_path, "plangen_cell8-p2_drug8-p2.json")
 
 #----------------------------------------------------------------------------------
 
